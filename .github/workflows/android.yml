@@ -1,3 +1,4 @@
+
 name: MonsterMusic Android Build
 
 on:
@@ -5,10 +6,12 @@ on:
     branches:
       - main
       - master
+
   pull_request:
     branches:
       - main
       - master
+
   workflow_dispatch:
 
 permissions:
@@ -20,137 +23,144 @@ concurrency:
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build MonsterMusic APK
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    env:
-      # ⚠️ 按项目 app/build.gradle(.kts) 实际值修改
-      ANDROID_PLATFORM: "android-36"          # 原 android-37（大概率不存在）
-      ANDROID_BUILD_TOOLS: "36.0.0"           # 原 build-tools;37.0.0（大概率不存在）
-      # 项目用 NDK 才填；不用就留空，安装/校验会自动跳过
-      ANDROID_NDK: ""                         # 原 ndk;30.0.16248370（不存在）
-      # 例："27.0.12077973"
-      ANDROID_CMAKE: "3.22.1"
-
     steps:
-      # 1. 获取源码
+      # 1. 获取 GitHub 仓库源码
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. 配置 Java（保持原样）
+      # 2. 配置 Java 21
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
-      # 3. 配置 Android SDK
+      # 3. 初始化 Android SDK
+      # 使用 v4，避免旧版尝试安装已经废弃的 tools 包
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
-      # 4. 自动定位 Gradle 项目根目录
+      # 4. 自动查找 Gradle 项目目录
       - name: Locate Gradle project
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository directory:"
-          pwd
-          echo "Repository contents:"
-          ls -la
+          echo "GitHub workspace:"
+          echo "$GITHUB_WORKSPACE"
 
-          echo "All gradlew candidates:"
-          mapfile -t WRAPPERS < <(find "$GITHUB_WORKSPACE" \
+          echo "Repository files:"
+          ls -la "$GITHUB_WORKSPACE"
+
+          GRADLEW_PATH="$(find "$GITHUB_WORKSPACE" \
             -maxdepth 6 \
             -type f \
             -name gradlew \
             -not -path "*/.gradle/*" \
-            -print)
+            -print -quit)"
 
-          printf '  %s\n' "${WRAPPERS[@]:-<none>}"
-
-          if [ "${#WRAPPERS[@]}" -eq 0 ]; then
-            echo "::error::Cannot find gradlew in repository."
+          if [ -z "$GRADLEW_PATH" ]; then
+            echo "::error::Cannot find gradlew."
             exit 1
           fi
 
-          # 优先取层级最浅的 gradlew 作为项目根
-          GRADLEW_PATH="$(printf '%s\n' "${WRAPPERS[@]}" \
-            | awk -F/ '{print NF"\t"$0}' | sort -n | head -n1 | cut -f2-)"
-
           PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
-          echo "Selected project: $PROJECT_DIR"
+
+          echo "Gradle project: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      # 5. 检查项目文件
-      - name: Verify project files
+      # 5. 检查 Gradle 项目文件
+      - name: Verify Gradle project
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$PROJECT_DIR"
 
-          echo "Project directory:"; pwd
-          echo "Gradle files:"
+          test -f gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.properties
+
+          chmod +x gradlew
+
+          echo "Gradle configuration:"
+          cat gradle/wrapper/gradle-wrapper.properties
+
+          echo "Project build files:"
           find . -maxdepth 4 \
-            \( -name "settings.gradle" -o -name "settings.gradle.kts" \
-            -o -name "build.gradle" -o -name "build.gradle.kts" \
-            -o -name "gradle-wrapper.properties" \) -print
+            \( -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "build.gradle" \
+            -o -name "build.gradle.kts" \) \
+            -print
 
-          test -f ./gradlew
-          test -f ./gradle/wrapper/gradle-wrapper.jar
-          test -f ./gradle/wrapper/gradle-wrapper.properties
-
-          echo "Gradle distribution:"
-          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
-          chmod +x ./gradlew
-
-      # 6. 接受许可
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: yes | sdkmanager --licenses > /dev/null || true
-
-      # 7. 安装构建组件（按需、NDK 可跳过）
-      - name: Install Android build components
+      # 6. 安装项目需要的 Android SDK
+      - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
 
-          PACKAGES=(
-            "platform-tools"
-            "platforms;${ANDROID_PLATFORM}"
-            "build-tools;${ANDROID_BUILD_TOOLS}"
-          )
-          [ -n "${ANDROID_NDK}" ]   && PACKAGES+=("ndk;${ANDROID_NDK}")
-          [ -n "${ANDROID_CMAKE}" ] && PACKAGES+=("cmake;${ANDROID_CMAKE}")
+          sdkmanager --install \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;30.0.16248370" \
+            "cmake;3.22.1"
 
-          echo "Installing:"
-          printf '  %s\n' "${PACKAGES[@]}"
-
-          sdkmanager --install "${PACKAGES[@]}"
-
-      # 8. 校验安装结果（按 env 动态校验，NDK/CMake 空则跳过）
-      - name: Verify build environment
+      # 7. 处理 Android 37 平台目录兼容问题
+      - name: Configure Android 37 platform compatibility
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Java version:"; java -version
-          echo "Android SDK:"; sdkmanager --list_installed
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
 
-          test -d "$ANDROID_HOME/platforms/${ANDROID_PLATFORM}"
-          test -d "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}"
-          [ -z "${ANDROID_NDK}" ]   || test -d "$ANDROID_HOME/ndk/${ANDROID_NDK}"
-          [ -z "${ANDROID_CMAKE}" ] || test -d "$ANDROID_HOME/cmake/${ANDROID_CMAKE}"
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && \
+             [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
 
-          echo "Environment verification passed."
+            ln -s android-37.0 \
+              "$SDK_ROOT/platforms/android-37"
+
+            echo "Created Android 37 compatibility alias."
+          fi
+
+          echo "Installed Android platforms:"
+          ls -la "$SDK_ROOT/platforms"
+
+      # 8. 验证 SDK 安装结果
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+
+          echo "Java:"
+          java -version
+
+          echo "Android SDK:"
+          sdkmanager --list_installed
+
+          test -d "$SDK_ROOT/platforms/android-37.0"
+          test -d "$SDK_ROOT/build-tools/37.0.0"
+          test -d "$SDK_ROOT/ndk/30.0.16248370"
+          test -d "$SDK_ROOT/cmake/3.22.1"
+
+          echo "Android SDK verification passed."
 
       # 9. 构建 Debug 和 Release APK
       - name: Build APKs
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$PROJECT_DIR"
+
           ./gradlew \
             --no-daemon \
             --stacktrace \
@@ -158,33 +168,37 @@ jobs:
             assembleDebug \
             assembleRelease
 
-      # 10. 收集 APK（用 process substitution，避免子 shell）
-      - name: Collect APK artifacts
+      # 10. 收集生成的 APK
+      - name: Collect APK files
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
 
-          OUT="$GITHUB_WORKSPACE/build-output"
-          mkdir -p "$OUT"
+          mkdir -p "$GITHUB_WORKSPACE/build-output"
 
-          found=0
+          find "$PROJECT_DIR" \
+            -type f \
+            -path "*/build/outputs/apk/*" \
+            -name "*.apk" \
+            -print0 |
           while IFS= read -r -d '' apk; do
-            relative_path="${apk#./}"
+            relative_path="${apk#"$PROJECT_DIR"/}"
             safe_name="${relative_path//\//-}"
-            cp "$apk" "$OUT/$safe_name"
-            found=$((found+1))
-          done < <(find . -type f -path "*/build/outputs/apk/*" -name "*.apk" -print0)
 
-          echo "Generated APK files ($found):"
-          ls -lh "$OUT" || true
+            cp "$apk" \
+              "$GITHUB_WORKSPACE/build-output/$safe_name"
+          done
 
-          if [ "$found" -eq 0 ]; then
+          echo "APK output:"
+          ls -lh "$GITHUB_WORKSPACE/build-output"
+
+          if ! find "$GITHUB_WORKSPACE/build-output" \
+            -type f -name "*.apk" -print -quit | grep -q .; then
             echo "::error::No APK files were generated."
             exit 1
           fi
 
-      # 11. 上传 APK
+      # 11. 上传 APK 到 GitHub Actions
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
