@@ -45,34 +45,38 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      # 4. 安装解压工具
-      - name: Install unzip
-        run: sudo apt-get update && sudo apt-get install -y unzip
-
-      # 5. 解压源码 ZIP 并定位 Gradle 项目
-      - name: Extract and locate Gradle project
+      # 4. 检查源码 ZIP
+      - name: Verify source archive
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$GITHUB_WORKSPACE"
 
-          SOURCE_ZIP="MonsterMusic_Source.zip"
-
-          if [ ! -f "$SOURCE_ZIP" ]; then
+          if [ ! -f "MonsterMusic_Source.zip" ]; then
             echo "::error::MonsterMusic_Source.zip not found."
             ls -lah
             exit 1
           fi
 
-          echo "Source ZIP:"
-          ls -lh "$SOURCE_ZIP"
+          echo "Source archive:"
+          ls -lh MonsterMusic_Source.zip
+
+          unzip -t MonsterMusic_Source.zip
+
+      # 5. 解压源码并定位 Gradle 项目
+      - name: Extract and locate Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
 
           mkdir -p "$GITHUB_WORKSPACE/source"
 
-          unzip -q "$SOURCE_ZIP" -d "$GITHUB_WORKSPACE/source"
+          unzip -q \
+            "$GITHUB_WORKSPACE/MonsterMusic_Source.zip" \
+            -d "$GITHUB_WORKSPACE/source"
 
-          echo "Extracted source files:"
+          echo "Extracted source:"
           ls -lah "$GITHUB_WORKSPACE/source"
 
           GRADLEW_PATH="$(find "$GITHUB_WORKSPACE/source" \
@@ -83,24 +87,21 @@ jobs:
             -print -quit)"
 
           if [ -z "$GRADLEW_PATH" ]; then
-            echo "::error::gradlew not found inside source ZIP."
+            echo "::error::gradlew not found in source archive."
 
-            echo "ZIP contents:"
-            unzip -l "$SOURCE_ZIP" | head -100
+            unzip -l "$GITHUB_WORKSPACE/MonsterMusic_Source.zip" | head -100
 
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
 
-          echo "Gradle project found:"
-          echo "$PROJECT_DIR"
-
+          echo "Project directory: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           chmod +x "$GRADLEW_PATH"
 
-      # 6. 验证 Gradle 项目
+      # 6. 验证 Gradle Wrapper
       - name: Verify Gradle project
         shell: bash
         run: |
@@ -108,17 +109,14 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          echo "Project directory:"
-          pwd
-
           test -f gradlew
           test -f gradle/wrapper/gradle-wrapper.jar
           test -f gradle/wrapper/gradle-wrapper.properties
 
-          echo "Gradle wrapper configuration:"
+          echo "Gradle wrapper:"
           cat gradle/wrapper/gradle-wrapper.properties
 
-          echo "Build files:"
+          echo "Project build files:"
           find . -maxdepth 4 \
             \( -name "settings.gradle" \
             -o -name "settings.gradle.kts" \
@@ -126,44 +124,81 @@ jobs:
             -o -name "build.gradle.kts" \) \
             -print
 
-      # 7. 接受 Android SDK 许可
-      - name: Accept Android SDK licenses
+      # 7. 检查 Android SDK 仓库中的 API 37 包名
+      - name: Detect Android 37 SDK package
         shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
+          set -euo pipefail
 
-      # 8. 安装 Android SDK 组件
+          sdkmanager --list --channel=3 > "$RUNNER_TEMP/sdk-packages.txt"
+
+          echo "Available Android 37 packages:"
+          grep -E 'platforms;android-37(\.0)?[[:space:]]*\|' \
+            "$RUNNER_TEMP/sdk-packages.txt" || true
+
+          PLATFORM_PACKAGE="$(
+            awk -F '|' '
+              {
+                gsub(/^[ \t]+|[ \t]+$/, "", $1)
+              }
+              $1 == "platforms;android-37" ||
+              $1 == "platforms;android-37.0" {
+                print $1
+                exit
+              }
+            ' "$RUNNER_TEMP/sdk-packages.txt"
+          )"
+
+          if [ -z "$PLATFORM_PACKAGE" ]; then
+            echo "::error::Android API 37 SDK package is not available."
+
+            echo "Available platform packages:"
+            grep -E 'platforms;android-' \
+              "$RUNNER_TEMP/sdk-packages.txt" || true
+
+            exit 1
+          fi
+
+          echo "Selected SDK package: $PLATFORM_PACKAGE"
+          echo "ANDROID_PLATFORM_PACKAGE=$PLATFORM_PACKAGE" >> "$GITHUB_ENV"
+
+      # 8. 安装 Android SDK、NDK 和 CMake
       - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager --install \
-            "platforms;android-37" \
-            "build-tools;37.0.0" \
+          sdkmanager --install --channel=3 \
+            "$ANDROID_PLATFORM_PACKAGE" \
             "ndk;30.0.16248370" \
             "cmake;3.22.1"
 
-      # 9. 验证 Android SDK
+      # 9. 验证 SDK 安装
       - name: Verify Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
-          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 
-          echo "Java:"
-          java -version
+          if [ -z "$SDK_ROOT" ]; then
+            echo "::error::Android SDK path is not configured."
+            exit 1
+          fi
 
-          echo "Installed SDK packages:"
+          echo "Android SDK: $SDK_ROOT"
+
+          echo "Installed packages:"
           sdkmanager --list_installed
 
-          test -d "$SDK_ROOT/platforms/android-37"
-          test -d "$SDK_ROOT/build-tools/37.0.0"
+          PLATFORM_NAME="${ANDROID_PLATFORM_PACKAGE#platforms;}"
+
+          test -d "$SDK_ROOT/platforms/$PLATFORM_NAME"
           test -d "$SDK_ROOT/ndk/30.0.16248370"
           test -d "$SDK_ROOT/cmake/3.22.1"
+          test -d "$SDK_ROOT/platform-tools"
 
-          echo "Android SDK verification passed."
+          echo "SDK verification passed."
 
       # 10. 构建 Debug 和 Release APK
       - name: Build APKs
@@ -186,7 +221,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/build-output"
+          OUTPUT_DIR="$GITHUB_WORKSPACE/build-output"
+
+          mkdir -p "$OUTPUT_DIR"
 
           find "$PROJECT_DIR" \
             -type f \
@@ -194,20 +231,21 @@ jobs:
             -name "*.apk" \
             -print0 |
           while IFS= read -r -d '' apk; do
+
             relative_path="${apk#"$PROJECT_DIR"/}"
             safe_name="${relative_path//\//-}"
 
-            cp "$apk" \
-              "$GITHUB_WORKSPACE/build-output/$safe_name"
+            cp "$apk" "$OUTPUT_DIR/$safe_name"
+
           done
 
           echo "Generated APK files:"
-          ls -lh "$GITHUB_WORKSPACE/build-output"
+          ls -lh "$OUTPUT_DIR"
 
-          if ! find "$GITHUB_WORKSPACE/build-output" \
+          if ! find "$OUTPUT_DIR" \
             -type f -name "*.apk" -print -quit | grep -q .; then
 
-            echo "::error::No APK files generated."
+            echo "::error::No APK files were generated."
             exit 1
           fi
 
